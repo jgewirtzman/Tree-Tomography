@@ -1,364 +1,14 @@
 # ERT Analysis Shiny App - Non-Linear Colorbar Mapping
-# Save as: ert_app_nonlinear.R
+#
+# Processing functions are shared with the headless CLI in processing.R.
 
 library(shiny)
 library(shinydashboard)
 library(DT)
-library(imager)
-library(dplyr)
-library(DescTools)
-library(sp)
 
-# ===== Processing Functions =====
-
-# Helper: cumulative arc-length parameter (robust to uneven sampling)
-arc_length_param <- function(col_df) {
-  if (nrow(col_df) < 2) return(rep(0, nrow(col_df)))
-  d <- sqrt(diff(col_df$r)^2 + diff(col_df$g)^2 + diff(col_df$b)^2)
-  s <- c(0, cumsum(d))
-  if (max(s) > 0) s / max(s) else s  # normalize 0..1
-}
-
-# Extract rows 3:8 only
-extract_colorbar <- function(img) {
-  W <- width(img)
-  rows <- 3:8
-  
-  # Average rows 3-8 across RGB
-  r_mat <- matrix(NA_real_, nrow = length(rows), ncol = W)
-  g_mat <- matrix(NA_real_, nrow = length(rows), ncol = W)
-  b_mat <- matrix(NA_real_, nrow = length(rows), ncol = W)
-  
-  for (i in seq_along(rows)) {
-    r_mat[i, ] <- as.vector(img[, rows[i], 1, 1])
-    g_mat[i, ] <- as.vector(img[, rows[i], 1, 2])
-    b_mat[i, ] <- as.vector(img[, rows[i], 1, 3])
-  }
-  
-  r <- colMeans(r_mat, na.rm = TRUE)
-  g <- colMeans(g_mat, na.rm = TRUE)
-  b <- colMeans(b_mat, na.rm = TRUE)
-  
-  cb <- data.frame(r = r, g = g, b = b)
-  
-  # Optional: trim a few pixels at each edge to avoid border artifacts
-  if (nrow(cb) > 6) {
-    cb <- cb[3:(nrow(cb)-2), ]
-  }
-  
-  # Light smoothing to denoise but preserve ends
-  if (nrow(cb) >= 5) {
-    k <- 5
-    smooth <- function(v) {
-      n <- length(v)
-      result <- numeric(n)
-      for(i in 1:n) {
-        start_idx <- max(1, i - 2)
-        end_idx <- min(n, i + 2)
-        result[i] <- mean(v[start_idx:end_idx])
-      }
-      result
-    }
-    cb$r <- smooth(cb$r)
-    cb$g <- smooth(cb$g)
-    cb$b <- smooth(cb$b)
-  }
-  
-  # Downsample uniformly to at most 256 samples
-  if (nrow(cb) > 256) {
-    idx <- round(seq(1, nrow(cb), length.out = 256))
-    cb <- cb[idx, , drop = FALSE]
-  }
-  
-  # Auto direction: expect blue-ish at low end, red-ish at high end
-  left_blue_score  <- cb$b[1] - cb$r[1]
-  right_red_score  <- cb$r[nrow(cb)] - cb$b[nrow(cb)]
-  if ( (left_blue_score + right_red_score) < 0 ) {
-    cb <- cb[nrow(cb):1, , drop = FALSE]
-  }
-  
-  # Store arc-length parameter
-  attr(cb, "t") <- arc_length_param(cb)
-  cb
-}
-
-# Create calibration function from user-specified points
-create_calibration_function <- function(calib_positions, calib_values, transform = "log") {
-  # Remove any NA entries
-  valid <- !is.na(calib_positions) & !is.na(calib_values)
-  if(sum(valid) < 2) {
-    stop("Need at least 2 calibration points")
-  }
-  
-  positions <- calib_positions[valid]
-  values <- calib_values[valid]
-  
-  # Sort by position
-  ord <- order(positions)
-  positions <- positions[ord]
-  values <- values[ord]
-  
-  # Create interpolation function based on transform
-  if(transform == "log") {
-    # Log transform for typical resistivity data
-    log_values <- log10(values)
-    
-    # Fit polynomial or spline to log-transformed data
-    if(length(positions) <= 3) {
-      # Simple linear interpolation in log space
-      interp_func <- approxfun(positions, log_values, rule = 2)
-      calib_func <- function(x) {
-        10^interp_func(x)
-      }
-    } else {
-      # Smooth spline in log space
-      fit <- smooth.spline(positions, log_values, spar = 0.5)
-      calib_func <- function(x) {
-        10^predict(fit, x)$y
-      }
-    }
-  } else if(transform == "linear") {
-    # Linear interpolation
-    calib_func <- approxfun(positions, values, rule = 2)
-  } else if(transform == "power") {
-    # Power law fit: value = a * position^b
-    if(length(positions) >= 2) {
-      log_pos <- log10(positions[positions > 0])
-      log_val <- log10(values[positions > 0])
-      fit <- lm(log_val ~ log_pos)
-      a <- 10^coef(fit)[1]
-      b <- coef(fit)[2]
-      calib_func <- function(x) {
-        a * x^b
-      }
-    } else {
-      calib_func <- approxfun(positions, values, rule = 2)
-    }
-  }
-  
-  return(calib_func)
-}
-
-# Map pixel colors using calibrated scale
-map_colors_calibrated <- function(pixel_colors, colorbar_colors, calib_func) {
-  if (is.null(colorbar_colors) || nrow(colorbar_colors) < 2) {
-    stop("Colorbar not available or too short")
-  }
-  
-  cb_mat <- as.matrix(colorbar_colors[, c("r","g","b")])
-  t_cb   <- attr(colorbar_colors, "t")
-  if (is.null(t_cb)) {
-    t_cb <- seq(0, 1, length.out = nrow(colorbar_colors))
-  }
-  
-  px <- as.matrix(pixel_colors)
-  n  <- nrow(px)
-  t_hat <- numeric(n)
-  
-  # Chunk to keep memory manageable
-  chunk <- 2000L
-  for (start in seq(1L, n, by = chunk)) {
-    end <- min(n, start + chunk - 1L)
-    x <- px[start:end, , drop = FALSE]
-    
-    # Euclidean NN in RGB
-    for (i in 1:nrow(x)) {
-      d <- (cb_mat[,1] - x[i,1])^2 + (cb_mat[,2] - x[i,2])^2 + (cb_mat[,3] - x[i,3])^2
-      k <- which.min(d)
-      t_hat[start + i - 1L] <- t_cb[k]
-    }
-  }
-  
-  # Apply calibration function
-  vals <- calib_func(t_hat)
-  vals
-}
-
-process_ert_with_mask <- function(img, mask_vector, image_name, 
-                                  calib_positions = NULL, calib_values = NULL,
-                                  transform = "log") {
-  
-  W <- width(img)
-  H <- height(img)
-  
-  # Extract horizontal colorbar from top of image
-  colorbar <- extract_colorbar(img)
-  
-  # Extract values from masked region
-  img_df <- as.data.frame(img, wide = "c") %>%
-    mutate(
-      inside = mask_vector,
-      r = c.1,
-      g = c.2, 
-      b = c.3
-    ) %>%
-    filter(inside == TRUE)
-  
-  if(nrow(img_df) == 0) {
-    stop("No pixels found in mask")
-  }
-  
-  # Get pixel colors
-  pixel_colors <- as.matrix(img_df[, c("r", "g", "b")])
-  
-  # Map colors to values
-  if(!is.null(colorbar) && nrow(colorbar) > 10) {
-    if(!is.null(calib_positions) && !is.null(calib_values)) {
-      # Use calibration curve
-      calib_func <- create_calibration_function(calib_positions, calib_values, transform)
-      values <- map_colors_calibrated(pixel_colors, colorbar, calib_func)
-    } else {
-      # Fallback to linear 0-1
-      warning("No calibration provided, using 0-1 scale")
-      cb_mat <- as.matrix(colorbar[, c("r","g","b")])
-      t_cb <- attr(colorbar, "t")
-      if(is.null(t_cb)) t_cb <- seq(0, 1, length.out = nrow(colorbar))
-      
-      px <- as.matrix(pixel_colors)
-      values <- numeric(nrow(px))
-      for(i in 1:nrow(px)) {
-        d <- (cb_mat[,1] - px[i,1])^2 + (cb_mat[,2] - px[i,2])^2 + (cb_mat[,3] - px[i,3])^2
-        k <- which.min(d)
-        values[i] <- t_cb[k]
-      }
-    }
-  } else {
-    stop("Could not extract colorbar")
-  }
-  
-  # Remove NA values
-  valid_idx <- !is.na(values)
-  values <- values[valid_idx]
-  img_df <- img_df[valid_idx,]
-  
-  if(length(values) == 0) {
-    stop("No valid values after processing")
-  }
-  
-  # Calculate metrics
-  cx <- mean(img_df$x)
-  cy <- mean(img_df$y)
-  r <- sqrt((img_df$x - cx)^2 + (img_df$y - cy)^2)
-  r_norm <- r / max(r)
-  
-  # 8-ring radial profile
-  n_rings <- 8
-  ring_breaks <- seq(0, 1, length.out = n_rings + 1)
-  ring_ids <- cut(r_norm, breaks = ring_breaks, include.lowest = TRUE, labels = FALSE)
-  ring_means <- tapply(values, ring_ids, mean, na.rm = TRUE)
-  ring_means[is.na(ring_means)] <- 0
-  
-  # CMA (Central Moisture Accumulation)
-  q_low <- quantile(values, probs = 0.30, na.rm = TRUE)
-  is_low <- values <= q_low
-  is_inner <- r_norm <= 0.33
-  
-  if(sum(is_low) > 0) {
-    CMA <- sum(is_low & is_inner) / sum(is_low)
-  } else {
-    CMA <- 0
-  }
-  
-  # Center and edge means
-  center_vals <- values[r_norm <= 0.33]
-  edge_vals <- values[r_norm >= 0.67]
-  
-  center_mean <- if(length(center_vals) > 0) mean(center_vals) else mean(values)
-  edge_mean <- if(length(edge_vals) > 0) mean(edge_vals) else mean(values)
-  
-  # Return comprehensive results
-  list(
-    file = image_name,
-    mean = mean(values),
-    median = median(values),
-    sd = sd(values),
-    cv = sd(values) / mean(values),
-    gini = Gini(values),
-    entropy = Entropy(values, method = "ML"),
-    CMA = CMA,
-    center_mean = center_mean,
-    edge_mean = edge_mean,
-    radial_gradient = edge_mean - center_mean,
-    n_pixels = length(values),
-    ring_profile = as.numeric(ring_means),
-    values = values,
-    spatial_data = img_df
-  )
-}
-
-# Auto-detect PiCUS blue boundary polygon from image
-auto_detect_polygon <- function(img) {
-  W <- width(img)
-  H <- height(img)
-  colorbar_cutoff <- min(40, round(H * 0.08))
-
-  # Extract pixel RGB below colorbar
-  rows <- (colorbar_cutoff + 1):H
-  r_vals <- as.vector(img[, rows, 1, 1])
-  g_vals <- as.vector(img[, rows, 1, 2])
-  b_vals <- as.vector(img[, rows, 1, 3])
-
-  # Grid coordinates (imager: x across columns, y across rows)
-  grid <- expand.grid(x = 1:W, row_idx = seq_along(rows))
-  grid$y <- rows[grid$row_idx]
-  grid$r <- r_vals
-  grid$g <- g_vals
-  grid$b <- b_vals
-
-  # Detect blue boundary pixels: high blue, low red, low green
-  grid$is_blue <- (grid$b > 0.4) & (grid$r < 0.3) & (grid$g < 0.4) &
-                  ((grid$b - grid$g) > 0.15)
-
-  blue_pts <- grid[grid$is_blue, c("x", "y")]
-
-  if (nrow(blue_pts) < 20) {
-    stop("Could not detect blue boundary polygon (only ", nrow(blue_pts),
-         " blue pixels found). Use manual polygon instead.")
-  }
-
-  # Centroid of blue pixels
-  cx <- median(blue_pts$x)
-  cy <- median(blue_pts$y)
-
-  # Bin by angle, take outermost blue pixel per bin
-  angles <- atan2(blue_pts$y - cy, blue_pts$x - cx)
-  dists  <- sqrt((blue_pts$x - cx)^2 + (blue_pts$y - cy)^2)
-
-  n_bins <- 180
-  bin_edges <- seq(-pi, pi, length.out = n_bins + 1)
-  poly_x <- numeric(n_bins)
-  poly_y <- numeric(n_bins)
-  valid   <- logical(n_bins)
-
-  for (i in 1:n_bins) {
-    in_bin <- angles >= bin_edges[i] & angles < bin_edges[i + 1]
-    if (any(in_bin)) {
-      max_idx <- which(in_bin)[which.max(dists[in_bin])]
-      poly_x[i] <- blue_pts$x[max_idx]
-      poly_y[i] <- blue_pts$y[max_idx]
-      valid[i]  <- TRUE
-    }
-  }
-
-  poly_x <- poly_x[valid]
-  poly_y <- poly_y[valid]
-
-  # Smooth (circular moving average, k=3)
-  n <- length(poly_x)
-  if (n > 10) {
-    k <- 3
-    px_s <- numeric(n); py_s <- numeric(n)
-    for (i in 1:n) {
-      idx <- ((i + (-k:k)) - 1) %% n + 1
-      px_s[i] <- mean(poly_x[idx])
-      py_s[i] <- mean(poly_y[idx])
-    }
-    poly_x <- px_s; poly_y <- py_s
-  }
-
-  # Return as Nx2 matrix (same format as manual polygon_points)
-  cbind(poly_x, poly_y)
-}
+# Source shared processing functions. processing.R also attaches imager, dplyr,
+# DescTools, and sp.
+source("processing.R", local = TRUE)
 
 # ===== Shiny UI =====
 ui <- dashboardPage(
@@ -482,27 +132,25 @@ ui <- dashboardPage(
                          status = "success",
                          solidHeader = TRUE,
                          width = NULL,
-                         
-                         actionButton("process_btn", "Process This Image", 
+
+                         actionButton("process_btn", "Process This Image",
                                       style = "width: 100%; font-size: 16px;"),
                          br(), br(),
+                         hr(),
+                         p(strong("Or process all uploaded images at once:")),
+                         actionButton("batch_btn", "Batch: Auto-Detect + Process All",
+                                      icon = icon("magic"),
+                                      style = "width: 100%;",
+                                      class = "btn-warning"),
+                         helpText("Runs auto-detect boundary + processing on every uploaded image using the current calibration. Failures are logged and skipped."),
+                         br(),
                          verbatimTextOutput("process_status")
                        )
                 ),
                 
                 # Right Panel - Image Display
                 column(width = 9,
-                       conditionalPanel(
-                         condition = "input.images",
-                         box(
-                           width = NULL,
-                           fluidRow(
-                             column(4, actionButton("prev_img", "← Previous")),
-                             column(4, h4(textOutput("image_counter"), align = "center")),
-                             column(4, actionButton("next_img", "Next →"))
-                           )
-                         )
-                       ),
+                       uiOutput("nav_controls"),
                        
                        box(
                          title = "Image Display - Click to add polygon points",
@@ -606,6 +254,7 @@ ui <- dashboardPage(
                          p("Adjust 'Edge Erosion' (default: 2 pixels) to exclude pixels near the boundary and reduce edge artifacts."),
                          
                          h4("Step 4: Process the Image"),
+                         p(strong("Single image:")),
                          tags$ol(
                            tags$li("Click 'Process This Image' to analyze the current image"),
                            tags$li("The Statistics box will display key metrics (Mean, CV, Gini, CMA) for the current image"),
@@ -613,6 +262,13 @@ ui <- dashboardPage(
                            tags$li("Results are automatically appended to the cumulative Results Table (one row per processed image)"),
                            tags$li("The polygon is cleared after processing so you can proceed to the next image"),
                            tags$li("Use the Previous/Next buttons to navigate between uploaded images and repeat Steps 3-4 for each")
+                         ),
+                         p(strong("Batch (auto-detect all):")),
+                         tags$ol(
+                           tags$li("Click 'Batch: Auto-Detect + Process All' to run the auto-detect polygon and processing pipeline on every uploaded image at once"),
+                           tags$li("Uses the current calibration and erosion settings"),
+                           tags$li("Images where auto-detect fails (e.g. no blue PiCUS polygon) are skipped and reported"),
+                           tags$li("Best for batches of PiCUS-style images that all have a clear blue boundary")
                          ),
 
                          h4("Step 5: Review and Export Results"),
@@ -701,6 +357,22 @@ ui <- dashboardPage(
 
                          hr(),
 
+                         h3("Run as a Command-Line Script"),
+                         p("If you have many images to process, you can run the same pipeline from R on the command line without using the web app. The script lives in the repository at ", code("app/ERT_App/batch.R"), "."),
+                         tags$pre(
+                           "# clone the repo, then:\n",
+                           "Rscript app/ERT_App/batch.R --input ./scans --output ./results\n",
+                           "\n",
+                           "# with options:\n",
+                           "Rscript app/ERT_App/batch.R \\\n",
+                           "  --input ./scans --output ./results \\\n",
+                           "  --transform log --erosion 2 \\\n",
+                           "  --calibration my_calibration.csv\n"
+                         ),
+                         p("The calibration CSV has two columns, ", code("position"), " and ", code("value"), ". If omitted, the defaults match the values pre-filled in the web app (30, 61, 125, 254, 518, 1000 at positions 0, 0.2, 0.4, 0.6, 0.8, 1.0). Required R packages: ", code("imager"), ", ", code("dplyr"), ", ", code("DescTools"), ", ", code("sp"), "."),
+
+                         hr(),
+
                          h3("About"),
                          p("This application was developed for extracting quantitative metrics from PiCUS ERT tomogram images, enabling reproducible, threshold-based decay classification. It is open-source and available at:"),
                          tags$a(href = "https://github.com/graceethompson/Tree-Tomography",
@@ -746,6 +418,23 @@ server <- function(input, output, session) {
     } else {
       paste(nrow(input$images), "files uploaded")
     }
+  })
+
+  # Navigation controls (rendered server-side so they always appear after upload)
+  output$nav_controls <- renderUI({
+    req(input$images)
+    box(
+      width = NULL,
+      status = "primary",
+      fluidRow(
+        column(4, actionButton("prev_img", "← Previous",
+                               width = "100%", icon = icon("arrow-left"))),
+        column(4, h4(textOutput("image_counter"), align = "center",
+                     style = "margin-top: 5px;")),
+        column(4, actionButton("next_img", "Next →",
+                               width = "100%", icon = icon("arrow-right")))
+      )
+    )
   })
   
   # Image display
@@ -991,7 +680,58 @@ server <- function(input, output, session) {
       })
     })
   })
-  
+
+  # Batch: auto-detect polygon + process every uploaded image
+  observeEvent(input$batch_btn, {
+    req(input$images)
+    calib <- get_calibration()
+    n <- nrow(input$images)
+    successes <- 0
+    failures <- character(0)
+
+    withProgress(message = 'Batch processing...', value = 0, {
+      for (i in seq_len(n)) {
+        fname <- input$images$name[i]
+        fpath <- input$images$datapath[i]
+        incProgress(1 / n, detail = sprintf("(%d/%d) %s", i, n, fname))
+
+        res <- tryCatch(
+          run_auto_pipeline(
+            image_path = fpath,
+            image_name = fname,
+            calib_positions = calib$positions,
+            calib_values = calib$values,
+            transform = input$transform,
+            erosion = input$erosion
+          ),
+          error = function(e) e
+        )
+
+        if (inherits(res, "error")) {
+          failures <- c(failures, sprintf("%s: %s", fname, conditionMessage(res)))
+          next
+        }
+
+        values$results_table <- rbind(values$results_table, result_to_row(res))
+        values$current_result <- res
+        successes <- successes + 1
+      }
+    })
+
+    if (length(failures) > 0) {
+      showNotification(
+        sprintf("Batch done: %d processed, %d failed. First failure: %s",
+                successes, length(failures), failures[1]),
+        type = "warning", duration = 10
+      )
+    } else {
+      showNotification(
+        sprintf("Batch done: %d images processed.", successes),
+        type = "message"
+      )
+    }
+  })
+
   # Navigation
   observeEvent(input$prev_img, {
     if(values$current_idx > 1) {

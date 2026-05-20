@@ -126,8 +126,11 @@ cat("\nPC1 threshold (training mean):", round(ert_threshold, 3), "\n")
 
 library(scales)
 
-spp_labels <- c(hem = "Hemlock", rm = "Red maple",
-                bg = "Black gum", ro = "Red oak")
+spp_labels <- c(hem = "T. canadensis", rm = "A. rubrum",
+                bg = "N. sylvatica", ro = "Q. rubra")
+
+# Italicized Latin labels for legend display
+italic_species <- function(x) parse(text = paste0("italic('", x, "')"))
 
 # Scores (all trees, PC1 vs PC2)
 pc1_scores <- all_scores[, 1]
@@ -163,7 +166,8 @@ loadings$label <- metric_labels[loadings$metric]
 # Variance explained
 ve <- summary(pca_fit)$importance[2, 1:2] * 100
 
-spp_shapes <- c(Hemlock = 16, "Red maple" = 17, "Black gum" = 15, "Red oak" = 18)
+spp_shapes <- c("T. canadensis" = 16, "A. rubrum" = 17,
+                "N. sylvatica" = 15, "Q. rubra" = 18)
 
 p_biplot <- ggplot(biplot_df, aes(x = PC1, y = PC2)) +
   geom_hline(yintercept = 0, color = "grey70", linewidth = 0.3) +
@@ -177,7 +181,8 @@ p_biplot <- ggplot(biplot_df, aes(x = PC1, y = PC2)) +
   geom_text(data = loadings,
             aes(x = PC1 * 1.12, y = PC2 * 1.12, label = label),
             color = "#B22222", size = 3.5, fontface = "bold", inherit.aes = FALSE) +
-  scale_shape_manual(name = "Species", values = spp_shapes) +
+  scale_shape_manual(name = "Species", values = spp_shapes,
+                     labels = italic_species) +
   labs(x = paste0("PC1 (", round(ve[1], 1), "% variance)\nhigh = wet / anomalous"),
        y = paste0("PC2 (", round(ve[2], 1), "% variance)")) +
   theme_classic(base_size = 13) +
@@ -275,7 +280,8 @@ p_final <- ggplot(dat, aes(x = pc1, y = structural_loss)) +
   geom_point(aes(shape = species_label),
              size = 3.5, alpha = 0.75, color = "grey20",
              position = position_jitter(width = 0, height = 0.1, seed = 42)) +
-  scale_shape_manual(name = "Species", values = spp_shapes) +
+  scale_shape_manual(name = "Species", values = spp_shapes,
+                     labels = italic_species) +
   scale_x_continuous(trans = signed_sqrt_trans,
                      breaks = c(-4, -2, -1, 0, 1, 2, 4)) +
   scale_y_continuous(trans = signed_sqrt_trans,
@@ -702,6 +708,7 @@ p_spp_pct <- ggplot(spp_counts, aes(x = species_label, y = pct, fill = quadrant)
   scale_fill_manual(name = "Decay Phase", values = quad_colors) +
   scale_color_manual(values = c("I: Sound" = "white", "II: Incipient" = "grey20",
                                 "III: Active" = "white", "IV: Cavity" = "white")) +
+  scale_x_discrete(labels = italic_species) +
   labs(x = NULL, y = "Percent of Trees") +
   theme_classic(base_size = 13) +
   theme(
